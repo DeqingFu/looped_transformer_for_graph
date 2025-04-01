@@ -17,21 +17,22 @@ python train.py \
   --sample_p True \
   --p_range 0.02 0.1 \
   --add_self_loops True \
-  --train_samples 100_000 \
+  --train_samples 50_000 \
   --val_samples 1_000 \
-  --n_loop 3 \
+  --n_loop 5 \
   --hidden_size 256 \
   --tie_qk True \
-  --read_in_method "linear" \
+  --read_in_method "zero_pad" \
   --num_attention_heads 1 \
-  --batch_size 32 \
+  --layernorm_type "post" \
+  --batch_size 64 \
   --learning_rate 1e-3 \
   --min_learning_rate 1e-6 \
-  --num_epochs 50 \
+  --num_epochs 100 \
   --clip_grad_norm 1.0 \
   --use_auxiliary_loss False \
   --aux_loss_weight 0.0 \
-  --seed 42 \
+  --seed 189763 \
   --output_dir $OUTPUT_DIR 
 
 echo "Training completed at $(date)" 

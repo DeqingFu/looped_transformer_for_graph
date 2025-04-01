@@ -2,23 +2,32 @@ import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 import numpy as np
 from typing import Dict, List, Optional, Tuple, Any
 import argparse
-import random
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import logging
 import json
 import pandas as pd
 from datetime import datetime
-import seaborn as sns
 
 from model import LoopedTransformer
 from data import ErdosRenyiGraphDataset
 
 import pdb
+
+from utils import (
+    set_seed, 
+    extract_qk_matrix,
+    plot_qk_matrix,
+    plot_qk_matrix_multi_head,
+    binary_cross_entropy_loss,
+    precompute_dataset,
+    compute_f1,
+    GraphConnectivityDataset
+)
 
 # Set up logging with a placeholder handler that will be replaced in the train function
 logging.basicConfig(
@@ -28,208 +37,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
-def set_seed(seed: int):
-    """Set random seed for reproducibility."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def extract_qk_matrix(model: LoopedTransformer):
-    """
-    Extract the QK matrix from the LoopedTransformer model.
-
-    Args:
-        model: LoopedTransformer model
-
-    Returns:
-        QK matrix
-    """
-    q_matrix = model.encoder.layer[0].attention.self.query.weight.data
-    k_matrix = model.encoder.layer[0].attention.self.key.weight.data
-    qk_matrix = torch.matmul(q_matrix, k_matrix.T)
-    return qk_matrix
-
-
-def plot_qk_matrix(qk_matrix: torch.Tensor, epoch: int, output_dir: str):
-    """
-    Plot the QK matrix using seaborn for better visualization.
-
-    Args:
-        qk_matrix: The QK matrix to plot
-        epoch: Current epoch number
-        output_dir: Directory to save the plot
-    """
-    # Create directory for QK visualizations if it doesn't exist
-    qk_vis_dir = os.path.join(output_dir, "QK_vis")
-    os.makedirs(qk_vis_dir, exist_ok=True)
-
-    # Convert tensor to numpy array for plotting
-    qk_numpy = qk_matrix.cpu().numpy()
-
-    # Create figure with appropriate size
-    plt.figure(figsize=(10, 8))
-
-    # Create heatmap with seaborn
-    ax = sns.heatmap(
-        qk_numpy,
-        cmap="viridis",
-        vmin=qk_numpy.min(),
-        vmax=qk_numpy.max(),
-        square=True,
-        cbar_kws={"shrink": 0.8},
-    )
-
-    # Add title and axis labels
-    plt.title(f"QK Matrix - Epoch {epoch}")
-    plt.xlabel("Key dimension")
-    plt.ylabel("Query dimension")
-
-    # Save the figure
-    plt.tight_layout()
-    filename = f"qk_matrix_epoch{epoch:03d}.png"
-    plt.savefig(os.path.join(qk_vis_dir, filename))
-    plt.close()
-
-
-def plot_qk_matrix_multi_head(model: LoopedTransformer, epoch: int, output_dir: str):
-    """
-    Extract and plot QK attention matrices for each attention head.
-
-    Args:
-        model: The LoopedTransformer model
-        epoch: Current epoch number
-        output_dir: Directory to save the plots
-    """
-    # Create directory for QK visualizations if it doesn't exist
-    qk_vis_dir = os.path.join(output_dir, "QK_vis")
-    os.makedirs(qk_vis_dir, exist_ok=True)
-
-    # Extract QK matrix
-    qk_matrix = extract_qk_matrix(model)
-
-    # Get model parameters
-    hidden_size = model.hidden_size
-    num_heads = model.config.num_attention_heads
-    head_size = hidden_size // num_heads
-
-    # Plot overall QK matrix
-    plot_qk_matrix(qk_matrix, epoch, output_dir)
-
-    # If we have multiple attention heads, visualize each head separately
-    if num_heads > 1:
-        # Create a figure for all heads
-        fig, axes = plt.subplots(
-            1, num_heads, figsize=(num_heads * 5, 5), squeeze=False
-        )
-
-        # For each attention head
-        for head_idx in range(num_heads):
-            # Calculate start and end indices for this head
-            start_idx = head_idx * head_size
-            end_idx = (head_idx + 1) * head_size
-
-            # Extract QK matrix for this head
-            head_qk = qk_matrix[start_idx:end_idx, start_idx:end_idx]
-            head_qk_numpy = head_qk.cpu().numpy()
-
-            # Plot on corresponding subplot
-            ax = axes[0, head_idx]
-            sns.heatmap(
-                head_qk_numpy,
-                cmap="viridis",
-                vmin=head_qk_numpy.min(),
-                vmax=head_qk_numpy.max(),
-                square=True,
-                ax=ax,
-                cbar=True if head_idx == num_heads - 1 else False,
-            )
-            ax.set_title(f"Head {head_idx+1}")
-
-            # Only show y labels for the first plot
-            if head_idx > 0:
-                ax.set_ylabel("")
-                ax.set_yticklabels([])
-
-        # Add overall title
-        fig.suptitle(f"QK Matrices by Attention Head - Epoch {epoch}", fontsize=16)
-        plt.tight_layout(rect=[0, 0, 1, 0.95])  # Make room for title
-
-        # Save the multi-head figure
-        filename = f"qk_matrix_heads_epoch{epoch:03d}.png"
-        plt.savefig(os.path.join(qk_vis_dir, filename))
-        plt.close()
-
-
-class GraphConnectivityDataset(Dataset):
-    """PyTorch dataset for graph connectivity prediction."""
-
-    def __init__(self, adj_matrices, conn_matrices):
-        """
-        Initialize dataset with precomputed adjacency and connectivity matrices.
-
-        Args:
-            adj_matrices: List of adjacency matrices
-            conn_matrices: List of connectivity matrices
-        """
-        self.adj_matrices = adj_matrices
-        self.conn_matrices = conn_matrices
-
-    def __len__(self):
-        return len(self.adj_matrices)
-
-    def __getitem__(self, idx):
-        return self.adj_matrices[idx], self.conn_matrices[idx]
-
-
-def precompute_dataset(dataset, num_samples):
-    """
-    Precompute all samples from a dataset.
-
-    Args:
-        dataset: ErdosRenyiGraphDataset
-        num_samples: Number of samples to generate
-
-    Returns:
-        adj_matrices: List of adjacency matrices
-        conn_matrices: List of connectivity matrices
-    """
-    adj_matrices = []
-    conn_matrices = []
-
-    for i in tqdm(range(num_samples), desc="Generating dataset"):
-        adj_matrix, conn_matrix = dataset[i]
-        adj_matrices.append(adj_matrix)
-        conn_matrices.append(conn_matrix)
-
-    return adj_matrices, conn_matrices
-
-
-def binary_cross_entropy_loss(predictions, targets, reduction="mean"):
-    """
-    Custom BCE loss for adjacency matrix prediction.
-
-    Args:
-        predictions: Predicted adjacency matrix
-        targets: Target adjacency matrix
-        reduction: Reduction method (mean or sum)
-
-    Returns:
-        BCE loss
-    """
-    epsilon = 1e-7
-    predictions = torch.clamp(predictions, epsilon, 1.0 - epsilon)
-    loss = -targets * torch.log(predictions) - (1 - targets) * torch.log(
-        1 - predictions
-    )
-
-    if reduction == "mean":
-        return torch.mean(loss)
-    else:
-        return torch.sum(loss)
 
 
 def evaluate(model, dataloader, device, threshold=0.5):
@@ -271,13 +78,7 @@ def evaluate(model, dataloader, device, threshold=0.5):
             correct = (pred_binary == connectivity_matrix).float().mean()
 
             # Calculate precision, recall, F1 (for positive class)
-            true_positives = (pred_binary * connectivity_matrix).sum()
-            predicted_positives = pred_binary.sum()
-            actual_positives = connectivity_matrix.sum()
-
-            precision = true_positives / (predicted_positives + 1e-7)
-            recall = true_positives / (actual_positives + 1e-7)
-            f1 = 2 * (precision * recall) / (precision + recall + 1e-7)
+            f1, precision, recall = compute_f1(pred_binary, connectivity_matrix)
 
             total_loss += loss.item() * adjacency_matrix.size(0)
             accuracy_sum += correct.item() * adjacency_matrix.size(0)
@@ -530,6 +331,10 @@ def train(args):
     logger.info(
         f"Initializing model with {args.graph_size} nodes, {args.n_loop} loops, {args.hidden_size} hidden size..."
     )
+
+    logger.info(
+        f"Readin method is {args.read_in_method}, layernorm type is {args.layernorm_type}"
+    )
     model = LoopedTransformer(
         graph_size=args.graph_size,
         n_loop=args.n_loop,
@@ -537,6 +342,7 @@ def train(args):
         read_in_method=args.read_in_method,
         num_attention_heads=args.num_attention_heads,
         tie_qk=args.tie_qk,
+        layernorm_type=args.layernorm_type,
     ).to(device)
 
     # Log model architecture and parameter count
@@ -828,6 +634,13 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--num_attention_heads", type=int, default=4, help="Number of attention heads"
+    )
+    parser.add_argument(
+        "--layernorm_type",
+        type=str,
+        default="post",
+        choices=["pre", "post"],
+        help="Type of layer normalization",
     )
 
     # Training parameters

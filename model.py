@@ -3,9 +3,16 @@ from torch import nn
 from typing import Optional
 
 from transformers.models.roberta_prelayernorm.modeling_roberta_prelayernorm import (
-    RobertaPreLayerNormEncoder,
+    RobertaPreLayerNormLayer,
     RobertaPreLayerNormConfig,
 )
+
+from transformers.models.roberta.modeling_roberta import (
+    RobertaLayer,
+    RobertaConfig
+)
+
+import pdb 
 
 
 class LoopedTransformer(nn.Module):
@@ -20,30 +27,40 @@ class LoopedTransformer(nn.Module):
         n_loop: int,
         hidden_size: int,
         read_in_method: str = "linear",  # "linear" or "zero_pad"
+        layernorm_type: str = "pre", # "pre" or "post"
         num_attention_heads: int = 1,
         tie_qk: bool = False,
     ):
         super().__init__()
-        self.config = RobertaPreLayerNormConfig(
-            hidden_size=hidden_size,
-            intermediate_size=hidden_size,
-            num_attention_heads=num_attention_heads,
-            num_hidden_layers=1,
-        )
-        self.encoder = RobertaPreLayerNormEncoder(self.config)
+        self.layernorm_type = layernorm_type
+        if layernorm_type == "pre":
+            self.config = RobertaPreLayerNormConfig(
+                hidden_size=hidden_size,
+                intermediate_size=hidden_size,
+                num_attention_heads=num_attention_heads,
+                num_hidden_layers=1,
+            )
+            self.layer = RobertaPreLayerNormLayer(self.config)
+            self.layer_norm = torch.nn.LayerNorm(hidden_size)
+        elif layernorm_type == "post":
+            self.config = RobertaConfig(
+                hidden_size=hidden_size,
+                intermediate_size=hidden_size,
+                num_attention_heads=num_attention_heads,
+                num_hidden_layers=1,
+            )
+            self.layer = RobertaLayer(self.config)
+
 
         if tie_qk:
-            # fmt: off
-            self.encoder.layer[0].attention.self.query.weight = (
-                self.encoder.layer[0].attention.self.key.weight)
-            self.encoder.layer[0].attention.self.query.bias = (
-                self.encoder.layer[0].attention.self.key.bias)
-            # fmt: on
+            self.layer.attention.self.query.weight = self.layer.attention.self.key.weight
+            self.layer.attention.self.query.bias = self.layer.attention.self.key.bias
         self.n_loop = n_loop
         self.hidden_size = hidden_size
         self.graph_size = graph_size  # number of nodes in the graph
 
         # Read-in layer: Convert adjacency matrix to hidden representation
+        self.read_in_method = read_in_method
         if read_in_method == "linear":
             self.read_in = nn.Linear(self.graph_size, hidden_size)
         elif read_in_method == "zero_pad":
@@ -67,7 +84,7 @@ class LoopedTransformer(nn.Module):
         """
         batch_size = adjacency_matrix.shape[0]
         # Apply read-in layer to get node embeddings
-        if self.read_in is not None:
+        if self.read_in_method == "linear":
             hidden_states = self.read_in(adjacency_matrix)
         else:
             # Zero padding method: Create embeddings and copy row sums to first dimension
@@ -78,20 +95,38 @@ class LoopedTransformer(nn.Module):
                 device=adjacency_matrix.device,
                 dtype=adjacency_matrix.dtype,
             )
-            hidden_states[:, :, self.graph_size] = adjacency_matrix
+            hidden_states[:, :, :self.graph_size] = adjacency_matrix
 
         # Loop the encoder n_loop times
-        layer_outputs = []
-        for _ in range(self.n_loop):
-            output = self.read_out(hidden_states)
-            hidden_states = self.encoder(
-                hidden_states=hidden_states,
-                attention_mask=None,
-            ).last_hidden_state
+        if self.layernorm_type == "pre":
+            layer_outputs = []
+            for _ in range(self.n_loop):
+                hidden_states = self.layer_norm(hidden_states) # extra layer norm before read out
+                output = self.read_out(hidden_states)
+                layer_outputs.append(output)
 
+                hidden_states = self.layer(
+                    hidden_states=hidden_states,
+                    attention_mask=None,
+                )[0]
+
+                
+
+            hidden_states = self.layer_norm(hidden_states)
+            output = self.read_out(hidden_states)
             layer_outputs.append(output)
 
-        output = self.read_out(hidden_states)
-        layer_outputs.append(output)
+        elif self.layernorm_type == "post":
+            layer_outputs = []
+            for _ in range(self.n_loop):
+                output = self.read_out(hidden_states)
+                layer_outputs.append(output)
+                hidden_states = self.layer(
+                    hidden_states=hidden_states,
+                    attention_mask=None,
+                )[0]
+                
+            output = self.read_out(hidden_states)
+            layer_outputs.append(output)
 
         return output, layer_outputs

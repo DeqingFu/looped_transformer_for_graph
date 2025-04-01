@@ -4,7 +4,7 @@
 # This script runs the training with all arguments explicitly specified
 
 # Create output directory if it doesn't exist
-NUM_NODES=32
+NUM_NODES=64
 OUTPUT_DIR="./outputs_${NUM_NODES}_nodes/$(date +%Y%m%d_%H%M%S)"
 mkdir -p $OUTPUT_DIR
 
@@ -15,22 +15,24 @@ echo "Output directory: $OUTPUT_DIR"
 python train.py \
   --graph_size $NUM_NODES \
   --sample_p True \
-  --p_range 0.02 0.04 \
+  --p_range 0.01 0.04 \
   --add_self_loops True \
-  --train_samples 100_000 \
+  --train_samples 50_000 \
   --val_samples 1_000 \
-  --n_loop 4 \
-  --hidden_size 256 \
-  --read_in_method "linear" \
+  --n_loop 6 \
+  --hidden_size 1024 \
+  --tie_qk True \
+  --read_in_method "zero_pad" \
   --num_attention_heads 1 \
-  --batch_size 32 \
+  --layernorm_type "post" \
+  --batch_size 64 \
   --learning_rate 1e-3 \
   --min_learning_rate 1e-6 \
-  --num_epochs 50 \
+  --num_epochs 100 \
   --clip_grad_norm 1.0 \
   --use_auxiliary_loss False \
   --aux_loss_weight 0.0 \
-  --seed 42 \
+  --seed 189763 \
   --output_dir $OUTPUT_DIR 
 
 echo "Training completed at $(date)" 
