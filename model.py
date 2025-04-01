@@ -21,6 +21,7 @@ class LoopedTransformer(nn.Module):
         hidden_size: int,
         read_in_method: str = "linear",  # "linear" or "zero_pad"
         num_attention_heads: int = 1,
+        tie_qk: bool = False,
     ):
         super().__init__()
         self.config = RobertaPreLayerNormConfig(
@@ -31,6 +32,13 @@ class LoopedTransformer(nn.Module):
         )
         self.encoder = RobertaPreLayerNormEncoder(self.config)
 
+        if tie_qk:
+            # fmt: off
+            self.encoder.layer[0].attention.self.query.weight = (
+                self.encoder.layer[0].attention.self.key.weight)
+            self.encoder.layer[0].attention.self.query.bias = (
+                self.encoder.layer[0].attention.self.key.bias)
+            # fmt: on
         self.n_loop = n_loop
         self.hidden_size = hidden_size
         self.graph_size = graph_size  # number of nodes in the graph

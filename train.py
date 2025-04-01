@@ -4,16 +4,21 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 import numpy as np
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 import argparse
 import random
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import logging
 import json
+import pandas as pd
+from datetime import datetime
+import seaborn as sns
 
 from model import LoopedTransformer
 from data import ErdosRenyiGraphDataset
+
+import pdb
 
 # Set up logging with a placeholder handler that will be replaced in the train function
 logging.basicConfig(
@@ -31,6 +36,132 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def extract_qk_matrix(model: LoopedTransformer):
+    """
+    Extract the QK matrix from the LoopedTransformer model.
+
+    Args:
+        model: LoopedTransformer model
+
+    Returns:
+        QK matrix
+    """
+    q_matrix = model.encoder.layer[0].attention.self.query.weight.data
+    k_matrix = model.encoder.layer[0].attention.self.key.weight.data
+    qk_matrix = torch.matmul(q_matrix, k_matrix.T)
+    return qk_matrix
+
+
+def plot_qk_matrix(qk_matrix: torch.Tensor, epoch: int, output_dir: str):
+    """
+    Plot the QK matrix using seaborn for better visualization.
+
+    Args:
+        qk_matrix: The QK matrix to plot
+        epoch: Current epoch number
+        output_dir: Directory to save the plot
+    """
+    # Create directory for QK visualizations if it doesn't exist
+    qk_vis_dir = os.path.join(output_dir, "QK_vis")
+    os.makedirs(qk_vis_dir, exist_ok=True)
+
+    # Convert tensor to numpy array for plotting
+    qk_numpy = qk_matrix.cpu().numpy()
+
+    # Create figure with appropriate size
+    plt.figure(figsize=(10, 8))
+
+    # Create heatmap with seaborn
+    ax = sns.heatmap(
+        qk_numpy,
+        cmap="viridis",
+        vmin=qk_numpy.min(),
+        vmax=qk_numpy.max(),
+        square=True,
+        cbar_kws={"shrink": 0.8},
+    )
+
+    # Add title and axis labels
+    plt.title(f"QK Matrix - Epoch {epoch}")
+    plt.xlabel("Key dimension")
+    plt.ylabel("Query dimension")
+
+    # Save the figure
+    plt.tight_layout()
+    filename = f"qk_matrix_epoch{epoch:03d}.png"
+    plt.savefig(os.path.join(qk_vis_dir, filename))
+    plt.close()
+
+
+def plot_qk_matrix_multi_head(model: LoopedTransformer, epoch: int, output_dir: str):
+    """
+    Extract and plot QK attention matrices for each attention head.
+
+    Args:
+        model: The LoopedTransformer model
+        epoch: Current epoch number
+        output_dir: Directory to save the plots
+    """
+    # Create directory for QK visualizations if it doesn't exist
+    qk_vis_dir = os.path.join(output_dir, "QK_vis")
+    os.makedirs(qk_vis_dir, exist_ok=True)
+
+    # Extract QK matrix
+    qk_matrix = extract_qk_matrix(model)
+
+    # Get model parameters
+    hidden_size = model.hidden_size
+    num_heads = model.config.num_attention_heads
+    head_size = hidden_size // num_heads
+
+    # Plot overall QK matrix
+    plot_qk_matrix(qk_matrix, epoch, output_dir)
+
+    # If we have multiple attention heads, visualize each head separately
+    if num_heads > 1:
+        # Create a figure for all heads
+        fig, axes = plt.subplots(
+            1, num_heads, figsize=(num_heads * 5, 5), squeeze=False
+        )
+
+        # For each attention head
+        for head_idx in range(num_heads):
+            # Calculate start and end indices for this head
+            start_idx = head_idx * head_size
+            end_idx = (head_idx + 1) * head_size
+
+            # Extract QK matrix for this head
+            head_qk = qk_matrix[start_idx:end_idx, start_idx:end_idx]
+            head_qk_numpy = head_qk.cpu().numpy()
+
+            # Plot on corresponding subplot
+            ax = axes[0, head_idx]
+            sns.heatmap(
+                head_qk_numpy,
+                cmap="viridis",
+                vmin=head_qk_numpy.min(),
+                vmax=head_qk_numpy.max(),
+                square=True,
+                ax=ax,
+                cbar=True if head_idx == num_heads - 1 else False,
+            )
+            ax.set_title(f"Head {head_idx+1}")
+
+            # Only show y labels for the first plot
+            if head_idx > 0:
+                ax.set_ylabel("")
+                ax.set_yticklabels([])
+
+        # Add overall title
+        fig.suptitle(f"QK Matrices by Attention Head - Epoch {epoch}", fontsize=16)
+        plt.tight_layout(rect=[0, 0, 1, 0.95])  # Make room for title
+
+        # Save the multi-head figure
+        filename = f"qk_matrix_heads_epoch{epoch:03d}.png"
+        plt.savefig(os.path.join(qk_vis_dir, filename))
+        plt.close()
 
 
 class GraphConnectivityDataset(Dataset):
@@ -166,6 +297,118 @@ def evaluate(model, dataloader, device, threshold=0.5):
     return metrics
 
 
+def plot_training_curves_by_epoch(
+    train_losses: List[float],
+    val_losses: List[float],
+    train_accuracies: List[float],
+    val_accuracies: List[float],
+    learning_rates: List[float],
+    output_dir: str,
+):
+    """
+    Plot training curves by epoch.
+
+    Args:
+        train_losses: List of training losses per epoch
+        val_losses: List of validation losses per epoch
+        train_accuracies: List of training accuracies per epoch
+        val_accuracies: List of validation accuracies per epoch
+        learning_rates: List of learning rates per epoch
+        output_dir: Directory to save the plot
+    """
+    plt.figure(figsize=(15, 5))
+
+    plt.subplot(1, 3, 1)
+    plt.plot(train_losses, label="Train Loss")
+    plt.plot(val_losses, label="Val Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.title("Training and Validation Loss by Epoch")
+
+    plt.subplot(1, 3, 2)
+    plt.plot(train_accuracies, label="Train Accuracy")
+    plt.plot(val_accuracies, label="Val Accuracy")
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy")
+    plt.legend()
+    plt.title("Training and Validation Accuracy by Epoch")
+
+    plt.subplot(1, 3, 3)
+    plt.plot(learning_rates, label="Learning Rate")
+    plt.xlabel("Epoch")
+    plt.ylabel("Learning Rate")
+    plt.legend()
+    plt.title("Learning Rate Schedule")
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "training_curves_by_epoch.png"))
+    plt.close()
+
+
+def plot_training_curves_by_step(step_data: pd.DataFrame, output_dir: str):
+    """
+    Plot training curves by step (batch).
+
+    Args:
+        step_data: DataFrame containing step-wise metrics
+        output_dir: Directory to save the plot
+    """
+    plt.figure(figsize=(15, 5))
+
+    plt.subplot(1, 2, 1)
+    plt.plot(step_data["step"], step_data["train_loss"], label="Train Loss")
+    plt.xlabel("Step")
+    plt.ylabel("Loss")
+    plt.title("Training Loss by Step")
+    plt.legend()
+
+    plt.subplot(1, 2, 2)
+    plt.plot(step_data["step"], step_data["train_accuracy"], label="Train Accuracy")
+    plt.xlabel("Step")
+    plt.ylabel("Accuracy")
+    plt.title("Training Accuracy by Step")
+    plt.legend()
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "training_curves_by_step.png"))
+    plt.close()
+
+
+def log_metrics(
+    metrics: Dict[str, Any],
+    epoch: int,
+    step: int,
+    phase: str,
+    step_df: pd.DataFrame,
+):
+    """
+    Log metrics to file and append to DataFrame for step-wise tracking.
+
+    Args:
+        metrics: Dictionary of metrics to log
+        epoch: Current epoch
+        step: Current step (batch)
+        phase: 'train' or 'val'
+        step_df: DataFrame to append step metrics to
+
+    Returns:
+        Updated DataFrame with new metrics
+    """
+
+    # Add to DataFrame for plotting
+    if phase == "train":
+        row = {
+            "epoch": epoch,
+            "step": step,
+            "train_loss": metrics.get("loss", 0),
+            "train_accuracy": metrics.get("accuracy", 0),
+        }
+        return pd.concat([step_df, pd.DataFrame([row])], ignore_index=True)
+
+    return step_df
+
+
 def train(args):
     """Main training function."""
     # Set seed for reproducibility
@@ -213,6 +456,30 @@ def train(args):
 
     logger.info(f"Logging to: {log_file}")
 
+    # Create files for step-wise and epoch-wise metrics
+    step_log_file = os.path.join(args.output_dir, "step_metrics.csv")
+    epoch_log_file = os.path.join(args.output_dir, "epoch_metrics.csv")
+
+    # Initialize DataFrames for logging
+    step_df = pd.DataFrame(columns=["epoch", "step", "train_loss", "train_accuracy"])
+    epoch_df = pd.DataFrame(
+        columns=[
+            "epoch",
+            "train_loss",
+            "train_accuracy",
+            "val_loss",
+            "val_accuracy",
+            "learning_rate",
+        ]
+    )
+
+    # Initialize files with headers
+    with open(step_log_file, "w") as f:
+        f.write("epoch,step,phase,loss,accuracy\n")
+
+    with open(epoch_log_file, "w") as f:
+        f.write("epoch,train_loss,train_accuracy,val_loss,val_accuracy,learning_rate\n")
+
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
@@ -237,57 +504,94 @@ def train(args):
         add_self_loops=args.add_self_loops,
     )
 
-    # Precompute all datasets
-    logger.info("Precomputing datasets for evaluation ...")
-
+    # Precompute validation dataset
+    logger.info("Precomputing validation dataset...")
     val_adj_matrices, val_conn_matrices = precompute_dataset(
         val_raw_dataset, args.val_samples
-    )
-
-    # Compute average label value to understand class distribution
-    avg_label = torch.stack(val_conn_matrices).float().mean().item()
-    logger.info(
-        f"Average connectivity in training set: {avg_label:.4f} (class balance)"
     )
 
     # Create PyTorch datasets
     val_dataset = GraphConnectivityDataset(val_adj_matrices, val_conn_matrices)
 
+    # Compute average connectivity in validation set
+    avg_label = torch.stack(val_conn_matrices).float().mean().item()
+    logger.info(
+        f"Average connectivity in validation set: {avg_label:.4f} (class balance)"
+    )
+
     # Create dataloaders
+    logger.info(f"Creating dataloaders with batch size {args.batch_size}...")
     train_dataloader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True
     )
-
     val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size)
 
     # Initialize model
-    logger.info("Initializing model...")
+    logger.info(
+        f"Initializing model with {args.graph_size} nodes, {args.n_loop} loops, {args.hidden_size} hidden size..."
+    )
     model = LoopedTransformer(
         graph_size=args.graph_size,
         n_loop=args.n_loop,
         hidden_size=args.hidden_size,
         read_in_method=args.read_in_method,
         num_attention_heads=args.num_attention_heads,
+        tie_qk=args.tie_qk,
     ).to(device)
 
+    # Log model architecture and parameter count
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(
+        f"Model initialized with {total_params} total parameters, {trainable_params} trainable parameters"
+    )
+    logger.info(f"Model architecture: {model}")
+
+    # Visualize initial QK matrix
+    logger.info("Visualizing initial QK matrix...")
+    if model.config.num_attention_heads > 1:
+        plot_qk_matrix_multi_head(model, 0, args.output_dir)
+    else:
+        qk_matrix = extract_qk_matrix(model)
+        plot_qk_matrix(qk_matrix, 0, args.output_dir)
+
     # Initialize optimizer
+    logger.info(f"Initializing optimizer with learning rate {args.learning_rate}...")
     optimizer = optim.AdamW(
         model.parameters(), lr=args.learning_rate, weight_decay=1e-4
     )
 
     # Initialize learning rate scheduler with cosine decay
+    logger.info(
+        f"Initializing learning rate scheduler with min_lr {args.min_learning_rate}..."
+    )
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.num_epochs, eta_min=args.min_learning_rate
     )
 
     # Training loop
     logger.info("Starting training...")
+    start_time = datetime.now()
+    logger.info(f"Training started at {start_time}")
+
     best_val_loss = float("inf")
     train_losses = []
     val_losses = []
     train_accuracies = []
     val_accuracies = []
     learning_rates = []
+    global_step = 0
+
+    # Run an initial evaluation on the randomly initialized model
+    logger.info("Evaluating initial model...")
+    initial_val_metrics = evaluate(model, val_dataloader, device)
+    logger.info(f"Initial validation metrics: {initial_val_metrics}")
+
+    # Log initial metrics to epoch file
+    with open(epoch_log_file, "a") as f:
+        f.write(
+            f"0,nan,0.0,{initial_val_metrics['loss']:.4f},{initial_val_metrics['accuracy']:.4f},{args.learning_rate:.6f}\n"
+        )
 
     for epoch in range(args.num_epochs):
         # Training phase
@@ -343,8 +647,23 @@ def train(args):
             total_train_accuracy += train_accuracy * batch_size
             train_samples += batch_size
 
+            # Update progress bar
             progress_bar.set_postfix({"loss": loss.item(), "acc": train_accuracy})
 
+            # Log batch-wise metrics
+            batch_metrics = {"loss": loss.item(), "accuracy": train_accuracy}
+            global_step += 1
+            step_df = log_metrics(
+                batch_metrics, epoch + 1, global_step, "train", step_df
+            )
+
+            # Write to CSV directly as well
+            with open(step_log_file, "a") as f:
+                f.write(
+                    f"{epoch+1},{global_step},train,{loss.item():.4f},{train_accuracy:.4f}\n"
+                )
+
+        # Epoch-level metrics
         avg_train_loss = total_train_loss / train_samples
         avg_train_accuracy = total_train_accuracy / train_samples
         train_losses.append(avg_train_loss)
@@ -354,6 +673,30 @@ def train(args):
         val_metrics = evaluate(model, val_dataloader, device)
         val_losses.append(val_metrics["loss"])
         val_accuracies.append(val_metrics["accuracy"])
+
+        # Visualize QK matrix at the end of each epoch
+        if model.config.num_attention_heads > 1:
+            plot_qk_matrix_multi_head(model, epoch + 1, args.output_dir)
+        else:
+            qk_matrix = extract_qk_matrix(model)
+            plot_qk_matrix(qk_matrix, epoch + 1, args.output_dir)
+
+        # Log epoch-wise metrics
+        with open(epoch_log_file, "a") as f:
+            f.write(
+                f"{epoch+1},{avg_train_loss:.4f},{avg_train_accuracy:.4f},{val_metrics['loss']:.4f},{val_metrics['accuracy']:.4f},{current_lr:.6f}\n"
+            )
+
+        # Add to epoch DataFrame
+        epoch_row = {
+            "epoch": epoch + 1,
+            "train_loss": avg_train_loss,
+            "train_accuracy": avg_train_accuracy,
+            "val_loss": val_metrics["loss"],
+            "val_accuracy": val_metrics["accuracy"],
+            "learning_rate": current_lr,
+        }
+        epoch_df = pd.concat([epoch_df, pd.DataFrame([epoch_row])], ignore_index=True)
 
         # Update learning rate with cosine scheduler (per epoch)
         scheduler.step()
@@ -372,10 +715,6 @@ def train(args):
         if val_metrics["loss"] < best_val_loss:
             best_val_loss = val_metrics["loss"]
 
-            # Create output directory if it doesn't exist
-            os.makedirs(args.output_dir, exist_ok=True)
-
-            # Save model
             torch.save(
                 {
                     "epoch": epoch,
@@ -388,34 +727,49 @@ def train(args):
 
             logger.info(f"Saved best model with val loss: {best_val_loss:.4f}")
 
-    # Plot training curves
-    plt.figure(figsize=(15, 5))
+        torch.save(
+            {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "val_loss": best_val_loss,
+            },
+            os.path.join(args.output_dir, "last_model.pt"),
+        )
+        logger.info(f"Saved latest model with val loss: {val_metrics['loss']:.4f}")
+        # Plot every few epochs or at the end
+        if (epoch + 1) % 5 == 0 or epoch == args.num_epochs - 1:
+            # Save plots
+            plot_training_curves_by_epoch(
+                train_losses,
+                val_losses,
+                train_accuracies,
+                val_accuracies,
+                learning_rates,
+                args.output_dir,
+            )
+            plot_training_curves_by_step(step_df, args.output_dir)
 
-    plt.subplot(1, 3, 1)
-    plt.plot(train_losses, label="Train Loss")
-    plt.plot(val_losses, label="Val Loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.legend()
-    plt.title("Training and Validation Loss")
+    # Save final DataFrames as CSV
+    step_df.to_csv(os.path.join(args.output_dir, "step_metrics_df.csv"), index=False)
+    epoch_df.to_csv(os.path.join(args.output_dir, "epoch_metrics_df.csv"), index=False)
 
-    plt.subplot(1, 3, 2)
-    plt.plot(train_accuracies, label="Train Accuracy")
-    plt.plot(val_accuracies, label="Val Accuracy")
-    plt.xlabel("Epoch")
-    plt.ylabel("Accuracy")
-    plt.legend()
-    plt.title("Training and Validation Accuracy")
+    # Calculate training time
+    end_time = datetime.now()
+    training_time = end_time - start_time
+    logger.info(f"Training completed at {end_time}")
+    logger.info(f"Total training time: {training_time}")
 
-    plt.subplot(1, 3, 3)
-    plt.plot(learning_rates, label="Learning Rate")
-    plt.xlabel("Epoch")
-    plt.ylabel("Learning Rate")
-    plt.legend()
-    plt.title("Learning Rate Schedule")
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(args.output_dir, "training_curves.png"))
+    # Plot final training curves
+    plot_training_curves_by_epoch(
+        train_losses,
+        val_losses,
+        train_accuracies,
+        val_accuracies,
+        learning_rates,
+        args.output_dir,
+    )
+    plot_training_curves_by_step(step_df, args.output_dir)
 
     return model
 
@@ -461,6 +815,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--hidden_size", type=int, default=128, help="Hidden size of the transformer"
+    )
+    parser.add_argument(
+        "--tie_qk", type=bool, default=False, help="Whether to tie Q and K weights"
     )
     parser.add_argument(
         "--read_in_method",
